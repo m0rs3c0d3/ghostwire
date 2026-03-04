@@ -18,8 +18,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 sha2 = "0.10"
 chrono = { version = "0.4", features = ["serde"] }
 hex = "0.4"
+clap = { version = "4", features = ["derive"] }
 
-# Phase 4: desktop notifications — enable with: cargo build --features desktop-notify
+# Desktop notifications — enable with: cargo build --features desktop-notify
 notify-rust = { version = "4", optional = true }
 
 [features]

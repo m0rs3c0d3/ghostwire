@@ -3,7 +3,10 @@ mod collector;
 mod models;
 mod profiler;
 
+use std::path::PathBuf;
+
 use clap::{Parser, Subcommand};
+use serde::Deserialize;
 use tokio::sync::mpsc;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
@@ -14,6 +17,98 @@ use profiler::Profiler;
 
 const DEFAULT_DB_PATH: &str = "/var/lib/ghostwire/devices.db";
 const DEFAULT_LOG_PATH: &str = "/var/log/ghostwire/events.log";
+
+// =============================================================================
+// Config file (Phase 5)
+// =============================================================================
+
+/// Persistent defaults loaded from `/etc/ghostwire/config.toml` and/or
+/// `~/.config/ghostwire/config.toml`. CLI flags always override config values.
+///
+/// Example config.toml:
+/// ```toml
+/// db_path  = "/var/lib/ghostwire/devices.db"
+/// log_path = "/var/log/ghostwire/events.log"
+/// notify   = true
+/// alert_threshold = 50
+/// warn_threshold  = 20
+/// ```
+#[derive(Debug, Default, Deserialize)]
+struct Config {
+    db_path: Option<String>,
+    log_path: Option<String>,
+    notify: Option<bool>,
+    alert_threshold: Option<u32>,
+    warn_threshold: Option<u32>,
+}
+
+impl Config {
+    /// Load config files in priority order: system → user (user wins).
+    ///
+    /// Silently skips missing or unreadable files.
+    fn load() -> Self {
+        let mut cfg = Config::default();
+
+        let candidates: Vec<PathBuf> = vec![
+            PathBuf::from("/etc/ghostwire/config.toml"),
+            dirs_config_path(),
+        ];
+
+        for path in candidates {
+            if !path.exists() {
+                continue;
+            }
+            match std::fs::read_to_string(&path) {
+                Ok(content) => match toml::from_str::<Config>(&content) {
+                    Ok(parsed) => cfg.merge(parsed),
+                    Err(e) => eprintln!(
+                        "warning: failed to parse config at {}: {}",
+                        path.display(),
+                        e
+                    ),
+                },
+                Err(e) => eprintln!(
+                    "warning: cannot read config at {}: {}",
+                    path.display(),
+                    e
+                ),
+            }
+        }
+
+        cfg
+    }
+
+    /// Merge `other` on top of `self` — only overwrites fields that are `Some`
+    /// in `other`.
+    fn merge(&mut self, other: Config) {
+        if other.db_path.is_some() {
+            self.db_path = other.db_path;
+        }
+        if other.log_path.is_some() {
+            self.log_path = other.log_path;
+        }
+        if other.notify.is_some() {
+            self.notify = other.notify;
+        }
+        if other.alert_threshold.is_some() {
+            self.alert_threshold = other.alert_threshold;
+        }
+        if other.warn_threshold.is_some() {
+            self.warn_threshold = other.warn_threshold;
+        }
+    }
+}
+
+/// Resolve `~/.config/ghostwire/config.toml` portably.
+fn dirs_config_path() -> PathBuf {
+    let base = std::env::var("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+            PathBuf::from(home).join(".config")
+        });
+    base.join("ghostwire").join("config.toml")
+}
 
 // =============================================================================
 // CLI definition
@@ -30,14 +125,14 @@ const DEFAULT_LOG_PATH: &str = "/var/log/ghostwire/events.log";
 )]
 struct Cli {
     /// Path to the SQLite trust-store database
-    #[arg(long, default_value = DEFAULT_DB_PATH, global = true)]
-    db_path: String,
+    #[arg(long, global = true)]
+    db_path: Option<String>,
 
     /// Path to the JSON event log
-    #[arg(long, default_value = DEFAULT_LOG_PATH, global = true)]
-    log_path: String,
+    #[arg(long, global = true)]
+    log_path: Option<String>,
 
-    /// Run in the foreground with human-readable log output (default: structured JSON)
+    /// Run in the foreground with human-readable log output (default: compact structured)
     #[arg(long, short = 'f', global = true)]
     foreground: bool,
 
@@ -54,14 +149,35 @@ enum Command {
     /// Run the daemon (default when no subcommand is given)
     Daemon,
 
-    /// Mark a device fingerprint as explicitly trusted
-    Trust {
-        /// SHA-256 fingerprint of the device (from `ghostwire list` or event log)
+    /// List all known device profiles in the trust store
+    List,
+
+    /// Show full details for a single device profile
+    Show {
+        /// Fingerprint prefix or full SHA-256 fingerprint
         fingerprint: String,
     },
 
-    /// List all known device profiles in the trust store
-    List,
+    /// Mark a device fingerprint as explicitly trusted
+    Trust {
+        /// SHA-256 fingerprint (from `ghostwire list`)
+        fingerprint: String,
+    },
+
+    /// Remove the trusted flag from a device
+    Untrust {
+        /// SHA-256 fingerprint
+        fingerprint: String,
+    },
+
+    /// Remove a device profile from the trust store entirely
+    ///
+    /// Historical events that reference this fingerprint are preserved.
+    /// The device will be treated as unknown the next time it connects.
+    Forget {
+        /// SHA-256 fingerprint
+        fingerprint: String,
+    },
 
     /// Show recent USB events with anomaly scores
     History {
@@ -72,6 +188,11 @@ enum Command {
 
     /// Export the full event log as JSON to stdout
     Export,
+
+    /// Verify the integrity of the tamper-evident event chain
+    ///
+    /// Exits with code 0 if the chain is intact, 1 if broken links are found.
+    Verify,
 }
 
 // =============================================================================
@@ -81,20 +202,33 @@ enum Command {
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
+    let file_cfg = Config::load();
+
+    // Merge: config file defaults → CLI overrides
+    let db_path = cli
+        .db_path
+        .or(file_cfg.db_path)
+        .unwrap_or_else(|| DEFAULT_DB_PATH.to_string());
+    let log_path = cli
+        .log_path
+        .or(file_cfg.log_path)
+        .unwrap_or_else(|| DEFAULT_LOG_PATH.to_string());
+    let notify = cli.notify || file_cfg.notify.unwrap_or(false);
 
     init_logging(cli.foreground);
-    info!("ghostwire v{}", env!("CARGO_PKG_VERSION"));
 
     match cli.command {
-        // ── One-shot management commands ──────────────────────────────────────
-        Some(Command::Trust { fingerprint }) => cmd_trust(&cli.db_path, &fingerprint),
-        Some(Command::List) => cmd_list(&cli.db_path),
-        Some(Command::History { limit }) => cmd_history(&cli.db_path, limit),
-        Some(Command::Export) => cmd_export(&cli.db_path),
-
-        // ── Daemon mode (default) ─────────────────────────────────────────────
+        Some(Command::List) => cmd_list(&db_path),
+        Some(Command::Show { fingerprint }) => cmd_show(&db_path, &fingerprint),
+        Some(Command::Trust { fingerprint }) => cmd_trust(&db_path, &fingerprint),
+        Some(Command::Untrust { fingerprint }) => cmd_untrust(&db_path, &fingerprint),
+        Some(Command::Forget { fingerprint }) => cmd_forget(&db_path, &fingerprint),
+        Some(Command::History { limit }) => cmd_history(&db_path, limit),
+        Some(Command::Export) => cmd_export(&db_path),
+        Some(Command::Verify) => cmd_verify(&db_path),
         None | Some(Command::Daemon) => {
-            run_daemon(&cli.db_path, &cli.log_path, cli.notify).await
+            info!("ghostwire v{}", env!("CARGO_PKG_VERSION"));
+            run_daemon(&db_path, &log_path, notify).await
         }
     }
 }
@@ -114,11 +248,7 @@ async fn run_daemon(db_path: &str, log_path: &str, notify: bool) {
     let (tx, mut rx) = mpsc::channel::<UsbEvent>(256);
     collector::spawn_collector(tx);
 
-    info!(
-        db  = db_path,
-        log = log_path,
-        "Listening for USB events"
-    );
+    info!(db = db_path, log = log_path, "Listening for USB events");
 
     while let Some(event) = rx.recv().await {
         let result = tokio::task::block_in_place(|| profiler.process_event(&event));
@@ -135,42 +265,9 @@ async fn run_daemon(db_path: &str, log_path: &str, notify: bool) {
 // Management subcommands
 // =============================================================================
 
-fn cmd_trust(db_path: &str, fingerprint: &str) {
-    let mut profiler = match Profiler::new(db_path) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("error: cannot open trust store at {}: {}", db_path, e);
-            std::process::exit(1);
-        }
-    };
-    match profiler.trust_device(fingerprint) {
-        Ok(true) => println!("Marked {} as trusted.", fingerprint),
-        Ok(false) => {
-            eprintln!("error: fingerprint not found in trust store: {}", fingerprint);
-            std::process::exit(1);
-        }
-        Err(e) => {
-            eprintln!("error: {}", e);
-            std::process::exit(1);
-        }
-    }
-}
-
 fn cmd_list(db_path: &str) {
-    let profiler = match Profiler::new(db_path) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("error: cannot open trust store at {}: {}", db_path, e);
-            std::process::exit(1);
-        }
-    };
-    let devices = match profiler.list_devices() {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("error: {}", e);
-            std::process::exit(1);
-        }
-    };
+    let profiler = open_profiler_ro(db_path);
+    let devices = unwrap_or_exit(profiler.list_devices(), "list devices");
 
     if devices.is_empty() {
         println!("No devices in trust store yet.");
@@ -200,21 +297,100 @@ fn cmd_list(db_path: &str) {
     println!("\n{} device(s) total.", devices.len());
 }
 
+fn cmd_show(db_path: &str, fingerprint: &str) {
+    let profiler = open_profiler_ro(db_path);
+
+    // Support prefix matching: collect all devices and filter
+    let devices = unwrap_or_exit(profiler.list_devices(), "list devices");
+    let matches: Vec<_> = devices
+        .iter()
+        .filter(|d| d.fingerprint.starts_with(fingerprint))
+        .collect();
+
+    match matches.len() {
+        0 => {
+            eprintln!("error: no device matching fingerprint prefix '{}'", fingerprint);
+            std::process::exit(1);
+        }
+        n if n > 1 => {
+            eprintln!(
+                "error: ambiguous fingerprint prefix '{}' matches {} devices — be more specific",
+                fingerprint, n
+            );
+            for d in &matches {
+                eprintln!("  {}", d.fingerprint);
+            }
+            std::process::exit(1);
+        }
+        _ => {}
+    }
+
+    let d = matches[0];
+    println!("Fingerprint  : {}", d.fingerprint);
+    println!("VID / PID    : {} / {}", d.vid, d.pid);
+    println!(
+        "Manufacturer : {}",
+        d.manufacturer.as_deref().unwrap_or("-")
+    );
+    println!("Product      : {}", d.product.as_deref().unwrap_or("-"));
+    println!("Serial       : {}", d.serial.as_deref().unwrap_or("-"));
+    println!(
+        "Device class : {}",
+        d.device_class.as_deref().unwrap_or("-")
+    );
+    println!(
+        "Interfaces   : {}",
+        d.interface_count
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "-".to_string())
+    );
+    println!("Port path    : {}", d.port_path);
+    println!("First seen   : {}", d.first_seen.format("%Y-%m-%d %H:%M:%S UTC"));
+    println!("Last seen    : {}", d.last_seen.format("%Y-%m-%d %H:%M:%S UTC"));
+    println!("Seen count   : {}", d.seen_count);
+    println!("Trusted      : {}", if d.trusted { "yes" } else { "no" });
+}
+
+fn cmd_trust(db_path: &str, fingerprint: &str) {
+    let mut profiler = open_profiler_rw(db_path);
+    match unwrap_or_exit(profiler.trust_device(fingerprint), "trust device") {
+        true => println!("Marked {} as trusted.", fingerprint),
+        false => {
+            eprintln!("error: fingerprint not found: {}", fingerprint);
+            std::process::exit(1);
+        }
+    }
+}
+
+fn cmd_untrust(db_path: &str, fingerprint: &str) {
+    let mut profiler = open_profiler_rw(db_path);
+    match unwrap_or_exit(profiler.untrust_device(fingerprint), "untrust device") {
+        true => println!("Removed trust from {}.", fingerprint),
+        false => {
+            eprintln!("error: fingerprint not found: {}", fingerprint);
+            std::process::exit(1);
+        }
+    }
+}
+
+fn cmd_forget(db_path: &str, fingerprint: &str) {
+    let mut profiler = open_profiler_rw(db_path);
+    match unwrap_or_exit(profiler.forget_device(fingerprint), "forget device") {
+        true => println!(
+            "Removed {} from the trust store.\n\
+             Historical events are preserved; the device will appear as UNKNOWN_DEVICE next time it connects.",
+            fingerprint
+        ),
+        false => {
+            eprintln!("error: fingerprint not found: {}", fingerprint);
+            std::process::exit(1);
+        }
+    }
+}
+
 fn cmd_history(db_path: &str, limit: u32) {
-    let profiler = match Profiler::new(db_path) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("error: cannot open trust store at {}: {}", db_path, e);
-            std::process::exit(1);
-        }
-    };
-    let rows = match profiler.recent_events(limit) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("error: {}", e);
-            std::process::exit(1);
-        }
-    };
+    let profiler = open_profiler_ro(db_path);
+    let rows = unwrap_or_exit(profiler.recent_events(limit), "read event history");
 
     if rows.is_empty() {
         println!("No events recorded yet.");
@@ -243,36 +419,68 @@ fn cmd_history(db_path: &str, limit: u32) {
 }
 
 fn cmd_export(db_path: &str) {
-    let profiler = match Profiler::new(db_path) {
+    let profiler = open_profiler_ro(db_path);
+    let events = unwrap_or_exit(profiler.export_events(), "export events");
+    let json = unwrap_or_exit(
+        serde_json::to_string_pretty(&events).map_err(|e| e.into()),
+        "serialize events",
+    );
+    println!("{}", json);
+}
+
+fn cmd_verify(db_path: &str) {
+    let profiler = open_profiler_ro(db_path);
+    let result = unwrap_or_exit(profiler.verify_chain(), "verify chain");
+
+    println!(
+        "Examined {} event rows.",
+        result.total
+    );
+
+    if result.is_ok() {
+        println!("Chain OK — no broken links found.");
+    } else {
+        eprintln!(
+            "CHAIN BROKEN — {} broken link(s) detected:",
+            result.broken.len()
+        );
+        for link in &result.broken {
+            eprintln!("  event {:>6}: {}", link.event_id, link.reason);
+        }
+        std::process::exit(1);
+    }
+}
+
+// =============================================================================
+// Helpers
+// =============================================================================
+
+fn open_profiler_ro(db_path: &str) -> Profiler {
+    match Profiler::new(db_path) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("error: cannot open trust store at {}: {}", db_path, e);
             std::process::exit(1);
         }
-    };
-    let events = match profiler.export_events() {
-        Ok(e) => e,
+    }
+}
+
+fn open_profiler_rw(db_path: &str) -> Profiler {
+    open_profiler_ro(db_path)
+}
+
+fn unwrap_or_exit<T>(result: Result<T, Box<dyn std::error::Error>>, ctx: &str) -> T {
+    match result {
+        Ok(v) => v,
         Err(e) => {
-            eprintln!("error: {}", e);
-            std::process::exit(1);
-        }
-    };
-    match serde_json::to_string_pretty(&events) {
-        Ok(json) => println!("{}", json),
-        Err(e) => {
-            eprintln!("error serializing events: {}", e);
+            eprintln!("error: {}: {}", ctx, e);
             std::process::exit(1);
         }
     }
 }
 
-// =============================================================================
-// Startup helpers
-// =============================================================================
-
 fn init_logging(foreground: bool) {
     if foreground {
-        // Human-readable for interactive/debug use
         tracing_subscriber::fmt()
             .with_env_filter(
                 EnvFilter::try_from_default_env()
@@ -281,7 +489,6 @@ fn init_logging(foreground: bool) {
             .with_target(false)
             .init();
     } else {
-        // Structured compact output for journald / log aggregators
         tracing_subscriber::fmt()
             .with_env_filter(
                 EnvFilter::try_from_default_env()

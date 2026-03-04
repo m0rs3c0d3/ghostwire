@@ -235,6 +235,97 @@ impl Profiler {
         Ok(profiles)
     }
 
+    /// Mark a fingerprint as not trusted. Returns `true` if found and updated.
+    pub fn untrust_device(
+        &mut self,
+        fingerprint: &str,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        let rows = self.conn.execute(
+            "UPDATE devices SET trusted = 0 WHERE fingerprint = ?1",
+            params![fingerprint],
+        )?;
+        Ok(rows > 0)
+    }
+
+    /// Remove a device profile entirely from the trust store.
+    ///
+    /// Historical events that reference this fingerprint are kept for audit
+    /// purposes — only the profile row is deleted.
+    ///
+    /// Returns `true` if a row was deleted, `false` if the fingerprint was not
+    /// found.
+    pub fn forget_device(
+        &mut self,
+        fingerprint: &str,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        let rows = self.conn.execute(
+            "DELETE FROM devices WHERE fingerprint = ?1",
+            params![fingerprint],
+        )?;
+        Ok(rows > 0)
+    }
+
+    /// Walk every event row in order and verify the SHA-256 chain.
+    ///
+    /// Returns a `ChainVerifyResult` with a list of broken links (if any).
+    /// An empty `broken` list means the log is intact.
+    pub fn verify_chain(&self) -> Result<ChainVerifyResult, Box<dyn std::error::Error>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, timestamp, fingerprint, anomaly_score, prev_hash, row_hash
+               FROM events
+              ORDER BY id ASC",
+        )?;
+
+        let rows: Vec<(u64, String, String, u32, Option<String>, String)> = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)? as u64,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get::<_, i64>(3)? as u32,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let total = rows.len() as u64;
+        let mut broken: Vec<BrokenLink> = Vec::new();
+        let mut expected_prev: &str = "genesis";
+
+        for (id, timestamp, fingerprint, score, prev_hash, row_hash) in &rows {
+            // Check that prev_hash matches what we computed from the prior row
+            let stored_prev = prev_hash.as_deref().unwrap_or("genesis");
+            if stored_prev != expected_prev {
+                broken.push(BrokenLink {
+                    event_id: *id,
+                    reason: format!(
+                        "prev_hash mismatch: expected '{}', got '{}'",
+                        expected_prev, stored_prev
+                    ),
+                });
+            }
+
+            // Recompute and verify the row's own hash
+            let expected_hash =
+                chain_hash(timestamp, fingerprint, *score, stored_prev);
+            if &expected_hash != row_hash {
+                broken.push(BrokenLink {
+                    event_id: *id,
+                    reason: format!(
+                        "row_hash mismatch: expected '{}', stored '{}'",
+                        expected_hash, row_hash
+                    ),
+                });
+            }
+
+            expected_prev = row_hash;
+        }
+
+        Ok(ChainVerifyResult { total, broken })
+    }
+
     /// Return recent events from the log, newest first, limited to `limit` rows.
     pub fn recent_events(
         &self,
@@ -526,6 +617,28 @@ pub struct EventRow {
     pub fingerprint: String,
     pub anomaly_score: u32,
     pub anomaly_flags: Option<String>,
+}
+
+/// Result of a `verify_chain` run.
+#[derive(Debug)]
+pub struct ChainVerifyResult {
+    /// Total number of event rows examined.
+    pub total: u64,
+    /// Any rows where the hash chain is broken. Empty means the log is intact.
+    pub broken: Vec<BrokenLink>,
+}
+
+impl ChainVerifyResult {
+    pub fn is_ok(&self) -> bool {
+        self.broken.is_empty()
+    }
+}
+
+/// Describes a single broken link in the event-chain.
+#[derive(Debug)]
+pub struct BrokenLink {
+    pub event_id: u64,
+    pub reason: String,
 }
 
 // =============================================================================

@@ -100,9 +100,7 @@ ghostwire [OPTIONS] [COMMAND]
 
 Options:
       --db-path <DB_PATH>    Path to the SQLite trust-store database
-                             [default: /var/lib/ghostwire/devices.db]
       --log-path <LOG_PATH>  Path to the JSON event log
-                             [default: /var/log/ghostwire/events.log]
   -f, --foreground           Human-readable log output (vs compact structured)
       --notify               Send desktop notifications for score > 50
   -h, --help                 Print help
@@ -110,10 +108,14 @@ Options:
 
 Commands:
   daemon   Run the daemon (default)
-  trust    Mark a device fingerprint as explicitly trusted
   list     List all known device profiles in the trust store
+  show     Show full details for a single device profile
+  trust    Mark a device fingerprint as explicitly trusted
+  untrust  Remove the trusted flag from a device
+  forget   Remove a device profile from the trust store entirely
   history  Show recent USB events with anomaly scores
   export   Export the full event log as JSON to stdout
+  verify   Verify the integrity of the tamper-evident event chain
 ```
 
 ### Examples
@@ -122,14 +124,26 @@ Commands:
 # List all known devices
 sudo ghostwire list
 
-# Mark a device as trusted (fingerprint from `list` or the event log)
+# Show full details for a device (supports fingerprint prefix matching)
+sudo ghostwire show a3f1c2
+
+# Mark a device as trusted
 sudo ghostwire trust a3f1c2b9e8d74f50...
+
+# Remove trust from a device without deleting its history
+sudo ghostwire untrust a3f1c2b9e8d74f50...
+
+# Remove a device from the trust store (will show as UNKNOWN_DEVICE on next plug)
+sudo ghostwire forget a3f1c2b9e8d74f50...
 
 # Show the last 50 events with scores
 sudo ghostwire history --limit 50
 
-# Export full event log for SIEM ingestion
+# Export full event log as JSON
 sudo ghostwire export > events.json
+
+# Verify the tamper-evident event chain (exits 0 = intact, 1 = broken)
+sudo ghostwire verify
 
 # Run with desktop notifications enabled (requires desktop-notify feature)
 sudo ghostwire --notify
@@ -137,6 +151,29 @@ sudo ghostwire --notify
 # Custom database and log paths
 sudo ghostwire --db-path /opt/ghostwire/db --log-path /opt/ghostwire/events.log
 ```
+
+---
+
+## Config File
+
+ghostwire reads persistent defaults from these locations (user config takes priority over system config):
+
+| Path | Scope |
+|---|---|
+| `/etc/ghostwire/config.toml` | System-wide |
+| `~/.config/ghostwire/config.toml` | Per-user (XDG-aware) |
+
+CLI flags always override config file values.
+
+**Example `/etc/ghostwire/config.toml`:**
+
+```toml
+db_path  = "/var/lib/ghostwire/devices.db"
+log_path = "/var/log/ghostwire/events.log"
+notify   = false
+```
+
+All keys are optional. Unknown keys are silently ignored.
 
 ---
 
@@ -246,7 +283,7 @@ Kernel uevent events won't flow without root/`CAP_NET_ADMIN`, but the CLI subcom
 | 2 | ✅ Done | Trust store — SQLite profiles, SHA-256 fingerprinting, tamper-evident log |
 | 3 | ✅ Done | Full anomaly scoring — all 8 flags including `HID_FAST_ENUM` |
 | 4 | ✅ Done | Daemon — CLI flags, desktop notifications, systemd unit |
-| 5 | Planned | `list` / `trust` / `history` / `export` CLI, webhook output for SIEM |
+| 5 | ✅ Done | Full management CLI (`show`, `untrust`, `forget`, `verify`), TOML config file |
 
 ---
 

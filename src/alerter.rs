@@ -1,5 +1,7 @@
 use std::fs::{self, OpenOptions};
 use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
 use tracing::{error, info, warn};
@@ -118,7 +120,12 @@ impl Alerter {
                 return;
             }
         };
-        match OpenOptions::new().create(true).append(true).open(path) {
+        match OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(path)
+        {
             Ok(mut f) => {
                 if let Err(e) = writeln!(f, "{}", line) {
                     error!("Failed to write to event log {}: {}", path, e);

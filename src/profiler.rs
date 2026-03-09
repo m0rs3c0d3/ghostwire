@@ -6,6 +6,8 @@ use rusqlite::{params, Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 use tracing::{debug, info};
 
+use tracing::warn;
+
 use crate::models::{AnomalyFlag, AnomalyResult, DeviceProfile, UsbEvent};
 
 /// How long to keep a pending-add record before discarding it (stale guard).
@@ -35,7 +37,19 @@ impl Profiler {
         }
 
         let conn = Connection::open(db_path)?;
+
+        // Restrict DB file permissions to owner-only (0600) — the trust store
+        // contains security-sensitive device profiles.
+        #[cfg(unix)]
+        if db_path != ":memory:" {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o600);
+            std::fs::set_permissions(db_path, perms)?;
+        }
+
         conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+        conn.execute_batch("PRAGMA busy_timeout=5000;")?;
+        conn.execute_batch("PRAGMA trusted_schema=OFF;")?;
 
         let profiler = Profiler {
             conn,
@@ -230,7 +244,10 @@ impl Profiler {
         )?;
         let profiles = stmt
             .query_map([], row_to_profile)?
-            .filter_map(|r| r.ok())
+            .filter_map(|r| match r {
+                Ok(v) => Some(v),
+                Err(e) => { warn!("Skipping malformed DB row: {}", e); None }
+            })
             .collect();
         Ok(profiles)
     }
@@ -279,15 +296,18 @@ impl Profiler {
         let rows: Vec<(u64, String, String, u32, Option<String>, String)> = stmt
             .query_map([], |row| {
                 Ok((
-                    row.get::<_, i64>(0)? as u64,
+                    row.get::<_, i64>(0)?.max(0) as u64,
                     row.get(1)?,
                     row.get(2)?,
-                    row.get::<_, i64>(3)? as u32,
+                    row.get::<_, i64>(3)?.max(0) as u32,
                     row.get(4)?,
                     row.get(5)?,
                 ))
             })?
-            .filter_map(|r| r.ok())
+            .filter_map(|r| match r {
+                Ok(v) => Some(v),
+                Err(e) => { warn!("Skipping malformed DB row: {}", e); None }
+            })
             .collect();
 
         let total = rows.len() as u64;
@@ -340,15 +360,18 @@ impl Profiler {
         let rows = stmt
             .query_map(params![limit as i64], |row| {
                 Ok(EventRow {
-                    id: row.get::<_, i64>(0)? as u64,
+                    id: row.get::<_, i64>(0)?.max(0) as u64,
                     timestamp: row.get(1)?,
                     action: row.get(2)?,
                     fingerprint: row.get(3)?,
-                    anomaly_score: row.get::<_, i64>(4)? as u32,
+                    anomaly_score: row.get::<_, i64>(4)?.max(0) as u32,
                     anomaly_flags: row.get(5)?,
                 })
             })?
-            .filter_map(|r| r.ok())
+            .filter_map(|r| match r {
+                Ok(v) => Some(v),
+                Err(e) => { warn!("Skipping malformed DB row: {}", e); None }
+            })
             .collect();
         Ok(rows)
     }
@@ -370,7 +393,10 @@ impl Profiler {
                     row.get::<_, Option<String>>(4)?,
                 ))
             })?
-            .filter_map(|r| r.ok())
+            .filter_map(|r| match r {
+                Ok(v) => Some(v),
+                Err(e) => { warn!("Skipping malformed DB row: {}", e); None }
+            })
             .filter_map(|(raw, score, flags, row_hash, prev_hash)| {
                 let mut v: serde_json::Value = serde_json::from_str(&raw).ok()?;
                 v["anomaly_score"] = serde_json::json!(score);
@@ -420,7 +446,10 @@ impl Profiler {
         )?;
         let profiles = stmt
             .query_map(params![vid, pid], row_to_profile)?
-            .filter_map(|r| r.ok())
+            .filter_map(|r| match r {
+                Ok(v) => Some(v),
+                Err(e) => { warn!("Skipping malformed DB row: {}", e); None }
+            })
             .collect();
         Ok(profiles)
     }
@@ -698,11 +727,13 @@ fn row_to_profile(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeviceProfile> {
         product: row.get(4)?,
         serial: row.get(5)?,
         device_class: row.get(6)?,
-        interface_count: row.get::<_, Option<i64>>(7)?.map(|c| c as u8),
+        interface_count: row
+            .get::<_, Option<i64>>(7)?
+            .map(|c| u8::try_from(c).unwrap_or(u8::MAX)),
         port_path: row.get(8)?,
         first_seen: parse_dt(&first_seen),
         last_seen: parse_dt(&last_seen),
         trusted: row.get::<_, i64>(11)? != 0,
-        seen_count: row.get::<_, i64>(12)? as u32,
+        seen_count: u32::try_from(row.get::<_, i64>(12)?).unwrap_or(u32::MAX),
     })
 }
